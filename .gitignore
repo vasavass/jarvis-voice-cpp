@@ -362,3 +362,14 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# AI models
+ggml-base.bin
+models/*.onnx
+
+# ONNX Runtime binaries
+onnxruntime/
+
+# Build files
+build/
+out/
+.vs/
