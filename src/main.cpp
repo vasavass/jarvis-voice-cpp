@@ -1,497 +1,516 @@
-﻿#include <algorithm>
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "httplib.h"
 #include "VoiceSynthesizer.h"
+#include "WakeWordDetector.h"
+#include "AudioCapture.h"
 #include "whisper.h"
+
+#include <nlohmann/json.hpp>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
 
 using namespace std;
 
-// ==========================================
-// JSON escaping
-// ==========================================
-
-string escapeJson(const string& text) {
-    string escaped;
-
-    for (char symbol : text) {
-        switch (symbol) {
-        case '"':
-            escaped += "\\\"";
-            break;
-
-        case '\\':
-            escaped += "\\\\";
-            break;
-
-        case '\n':
-            escaped += "\\n";
-            break;
-
-        case '\r':
-            escaped += "\\r";
-            break;
-
-        case '\t':
-            escaped += "\\t";
-            break;
-
-        default:
-            escaped += symbol;
-        }
-    }
-
-    return escaped;
-}
-
-// ==========================================
-// WAV header
-// ==========================================
+// Порог Wake Word: 0.18f — шорохи и вздохи во время речи Джарвиса больше не дают ложный __WAKE__
+constexpr float WAKE_WORD_THRESHOLD = 0.18f;
 
 #pragma pack(push, 1)
-
 struct WavHeader {
-    char riff_tag[4] = {
-        'R', 'I', 'F', 'F'
-    };
-
+    char riff_tag[4] = { 'R', 'I', 'F', 'F' };
     uint32_t riff_length = 0;
-
-    char wave_tag[4] = {
-        'W', 'A', 'V', 'E'
-    };
-
-    char fmt_tag[4] = {
-        'f', 'm', 't', ' '
-    };
-
+    char wave_tag[4] = { 'W', 'A', 'V', 'E' };
+    char fmt_tag[4] = { 'f', 'm', 't', ' ' };
     uint32_t fmt_length = 16;
     uint16_t audio_format = 1;
     uint16_t num_channels = 1;
-
     uint32_t sample_rate = 22050;
-
-    uint32_t byte_rate =
-        22050 * sizeof(int16_t);
-
-    uint16_t block_align =
-        sizeof(int16_t);
-
+    uint32_t byte_rate = 22050 * sizeof(int16_t);
+    uint16_t block_align = sizeof(int16_t);
     uint16_t bits_per_sample = 16;
-
-    char data_tag[4] = {
-        'd', 'a', 't', 'a'
-    };
-
+    char data_tag[4] = { 'd', 'a', 't', 'a' };
     uint32_t data_length = 0;
 };
-
 #pragma pack(pop)
 
-static_assert(
-    sizeof(WavHeader) == 44,
-    "WAV header must be exactly 44 bytes"
+static_assert(sizeof(WavHeader) == 44, "WavHeader must be exactly 44 bytes");
+
+filesystem::path getExecutableDirectory() {
+#ifdef _WIN32
+    // Буфер в куче (vector), а не на стеке — убирает предупреждение C6262 (64 КБ стека)
+    std::vector<wchar_t> executablePath(32768);
+    const DWORD length = GetModuleFileNameW(
+        nullptr,
+        executablePath.data(),
+        static_cast<DWORD>(executablePath.size())
     );
+    if (length == 0) {
+        throw runtime_error("Failed to determine executable directory");
+    }
+    return filesystem::path(executablePath.data(), executablePath.data() + length).parent_path();
+#else
+    return filesystem::current_path();
+#endif
+}
 
-// ==========================================
-// Float audio -> PCM16 WAV
-// ==========================================
-
-string floatToWav(
-    const vector<float>& audio_data
-) {
-    if (audio_data.empty()) {
+string floatToWav(const vector<float>& audioData, int sampleRate) {
+    if (audioData.empty()) {
         return {};
+    }
+    if (sampleRate <= 0) {
+        throw runtime_error("Invalid TTS sample rate");
+    }
+
+    const size_t audioBytes = audioData.size() * sizeof(int16_t);
+    if (audioBytes > numeric_limits<uint32_t>::max()) {
+        throw runtime_error("Generated audio is too large");
     }
 
     WavHeader header;
+    header.sample_rate = static_cast<uint32_t>(sampleRate);
+    header.byte_rate = header.sample_rate * header.num_channels * sizeof(int16_t);
+    header.block_align = header.num_channels * sizeof(int16_t);
+    header.data_length = static_cast<uint32_t>(audioBytes);
+    header.riff_length = header.data_length + static_cast<uint32_t>(sizeof(WavHeader)) - 8;
 
-    header.data_length = static_cast<uint32_t>(
-        audio_data.size() * sizeof(int16_t)
-        );
+    string wavBytes;
+    wavBytes.resize(sizeof(WavHeader) + audioBytes);
+    memcpy(wavBytes.data(), &header, sizeof(WavHeader));
 
-    header.riff_length =
-        header.data_length +
-        static_cast<uint32_t>(sizeof(WavHeader)) -
-        8;
-
-    string wav_bytes;
-
-    wav_bytes.resize(
-        sizeof(WavHeader) + header.data_length
-    );
-
-    // Записываем WAV-заголовок.
-    memcpy(
-        wav_bytes.data(),
-        &header,
-        sizeof(WavHeader)
-    );
-
-    // Float (-1.0...1.0) -> PCM16.
-    for (size_t i = 0; i < audio_data.size(); ++i) {
-        const float clamped_sample = clamp(
-            audio_data[i],
-            -1.0f,
-            1.0f
-        );
-
-        const int16_t pcm_sample =
-            static_cast<int16_t>(
-                clamped_sample * 32767.0f
-                );
-
-        memcpy(
-            wav_bytes.data() +
-            sizeof(WavHeader) +
-            i * sizeof(int16_t),
-
-            &pcm_sample,
-            sizeof(int16_t)
-        );
+    int16_t* pcmData = reinterpret_cast<int16_t*>(wavBytes.data() + sizeof(WavHeader));
+    for (size_t i = 0; i < audioData.size(); ++i) {
+        const float clamped = clamp(audioData[i], -1.0f, 1.0f);
+        pcmData[i] = static_cast<int16_t>(lround(clamped * 32767.0f));
     }
 
-    return wav_bytes;
+    return wavBytes;
 }
 
-// ==========================================
-// Main
-// ==========================================
+// Проверка наличия кириллических символов UTF-8 в строке (авто-определение русского текста)
+bool containsCyrillic(const string& text) {
+    for (size_t i = 0; i + 1 < text.size(); ++i) {
+        const unsigned char b1 = static_cast<unsigned char>(text[i]);
+        const unsigned char b2 = static_cast<unsigned char>(text[i + 1]);
+        if ((b1 == 0xD0 || b1 == 0xD1) && (b2 >= 0x80 && b2 <= 0xBF)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Отсекает "галлюцинации" Whisper на тишине/шуме: [BLANK_AUDIO], [Music], (laughs), *noise* и т.п.
+bool isNoiseArtifact(const string& text) {
+    const size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == string::npos) {
+        return true; // одни пробелы
+    }
+    const size_t last = text.find_last_not_of(" \t\r\n");
+    const string trimmed = text.substr(first, last - first + 1);
+
+    if (trimmed.find("[BLANK_AUDIO]") != string::npos ||
+        trimmed.find("[XBOX SOUND]") != string::npos ||
+        trimmed.find("[BOOM]") != string::npos ||
+        trimmed.find("???") != string::npos) {
+        return true;
+    }
+
+    const char f = trimmed.front();
+    const char l = trimmed.back();
+    if ((f == '[' && l == ']') || (f == '(' && l == ')') || (f == '*' && l == '*')) {
+        return true;
+    }
+    return false;
+}
+
+int getOptimalWhisperThreads() {
+    const unsigned int hw = std::thread::hardware_concurrency();
+    return static_cast<int>(std::min(8u, hw > 0u ? hw : 4u));
+}
+
+// Строгий детектор только из 3 разрешенных языков: en, ru, lt
+// Заодно один раз вычисляет mel-спектрограмму в состоянии контекста, чтобы whisper_full не считал её повторно.
+const char* detectAllowedLanguage(whisper_context* ctx, const vector<float>& pcmFloat, int nThreads, bool& melReady) {
+    melReady = false;
+    const int maxId = whisper_lang_max_id();
+    vector<float> probs(maxId + 1, 0.0f);
+
+    if (whisper_pcm_to_mel(ctx, pcmFloat.data(), static_cast<int>(pcmFloat.size()), nThreads) != 0) {
+        return "en";
+    }
+    melReady = true;
+
+    if (whisper_lang_auto_detect(ctx, 0, nThreads, probs.data()) < 0) {
+        return "en";
+    }
+
+    const int idEn = whisper_lang_id("en");
+    const int idRu = whisper_lang_id("ru");
+    const int idLt = whisper_lang_id("lt");
+
+    const float pEn = (idEn >= 0) ? probs[idEn] : 0.0f;
+    const float pRu = (idRu >= 0) ? probs[idRu] : 0.0f;
+    const float pLt = (idLt >= 0) ? probs[idLt] : 0.0f;
+
+    const char* chosen = "en";
+    float bestProb = pEn;
+
+    if (pRu > bestProb) {
+        bestProb = pRu;
+        chosen = "ru";
+    }
+    if (pLt > bestProb) {
+        bestProb = pLt;
+        chosen = "lt";
+    }
+
+    cout << "[OMNI STT] 3-Lang Filter -> Selected: '" << chosen
+        << "' (en=" << pEn << ", ru=" << pRu << ", lt=" << pLt << ")" << endl;
+
+    return chosen;
+}
 
 int main() {
-    // ==========================================
-    // Loading Piper ONNX
-    // ==========================================
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+#endif
 
-    const wstring tts_model_path =
-        L"models/en_US-lessac-high.onnx";
+    whisper_context* whisperContext = nullptr;
 
-    VoiceSynthesizer tts(tts_model_path);
+    try {
+        const filesystem::path executableDirectory = getExecutableDirectory();
+        cout << "[Jarvis] Executable directory: " << executableDirectory.string() << endl;
 
-    // ==========================================
-    // Loading Whisper
-    // ==========================================
+        // 1. Порог Wake Word: 0.18f, чтобы шорохи во время ответа не давали ложный __WAKE__
+        const filesystem::path modelsDir = executableDirectory / "models";
+        auto wakeWordDetector = make_shared<WakeWordDetector>(modelsDir, WAKE_WORD_THRESHOLD);
+        cout << "[Jarvis] Wake Word Detector initialized (threshold = " << WAKE_WORD_THRESHOLD << ")." << endl;
 
-    cout << "[Jarvis STT] Loading Whisper model..."
-        << endl;
+        const filesystem::path whisperModelPath = executableDirectory / "ggml-base.bin";
+        const filesystem::path espeakDataPath = executableDirectory / "espeak-ng-data";
 
-    whisper_context_params context_params =
-        whisper_context_default_params();
+        if (!filesystem::exists(whisperModelPath)) {
+            throw runtime_error("Whisper model not found: " + whisperModelPath.string());
+        }
+        if (!filesystem::exists(espeakDataPath)) {
+            throw runtime_error("espeak-ng-data not found: " + espeakDataPath.string());
+        }
 
-    whisper_context* whisper_context =
-        whisper_init_from_file_with_params(
-            "ggml-base.bin",
-            context_params
+        // ======================================
+        // 2. Инициализация Мультиязычного Voice Pool (EN, RU, LT)
+        // ======================================
+        unordered_map<string, unique_ptr<VoiceSynthesizer>> voicePool;
+
+        auto registerVoice = [&](const string& lang, const string& onnxFile) {
+            const filesystem::path modelPath = modelsDir / onnxFile;
+            const filesystem::path configPath = modelsDir / (onnxFile + ".json");
+
+            if (filesystem::exists(modelPath) && filesystem::exists(configPath)) {
+                cout << "[Jarvis TTS] Loading [" << lang << "] voice: " << onnxFile << "..." << endl;
+                voicePool[lang] = make_unique<VoiceSynthesizer>(
+                    modelPath.string(),
+                    configPath.string(),
+                    espeakDataPath.string()
+                );
+            }
+            else {
+                cerr << "[Jarvis TTS] WARNING: Voice model for [" << lang << "] not found at: "
+                    << modelPath.string() << endl;
+            }
+            };
+
+        registerVoice("ru", "ru_RU-denis-medium.onnx");
+        registerVoice("lt", "lt_LT-reginute1-medium.onnx");
+        registerVoice("en", "en_US-lessac-medium.onnx");
+
+        if (voicePool.find("en") == voicePool.end()) {
+            throw runtime_error("Primary English voice (en_US-lessac-medium.onnx) is required!");
+        }
+
+        // ======================================
+        // 3. Загрузка Whisper
+        // ======================================
+        cout << "[Jarvis STT] Loading Whisper model..." << endl;
+        whisper_context_params contextParams = whisper_context_default_params();
+        whisperContext = whisper_init_from_file_with_params(
+            whisperModelPath.string().c_str(),
+            contextParams
         );
 
-    if (whisper_context == nullptr) {
-        cerr << "[Jarvis STT] ERROR: "
-            << "Failed to load ggml-base.bin!"
-            << endl;
+        if (whisperContext == nullptr) {
+            throw runtime_error("Failed to load Whisper model");
+        }
+        cout << "[Jarvis STT] Whisper model loaded!" << endl;
 
-        return 1;
-    }
+        mutex whisperMutex;
+        mutex ttsMutex;
 
-    cout << "[Jarvis STT] Whisper model loaded!"
-        << endl;
+        // Неблокирующий сигнал пробуждения в отдельном потоке
+        auto on_wake_word_detected = []() {
+            std::thread([]() {
+                try {
+                    nlohmann::json wakeJson = { {"text", "__WAKE__"} };
+                    httplib::Client cli("http://127.0.0.1:8080");
+                    cli.set_connection_timeout(1, 0);
+                    cli.set_read_timeout(1, 0);
+                    cli.Post("/api/jarvis/command", wakeJson.dump(), "application/json");
+                    cout << "[OMNI] Instant WAKE signal delivered to Java." << endl;
+                }
+                catch (...) {}
+                }).detach();
+            };
 
-    // ==========================================
-    // HTTP server
-    // ==========================================
+        // Распознавание речи строго на 3 языках (EN / RU / LT)
+        auto on_speech_detected = [&whisperContext, &whisperMutex](const vector<float>& pcmFloat) {
+            if (pcmFloat.empty()) {
+                return;
+            }
 
-    httplib::Server server;
+            string transcription = "";
 
-    mutex whisper_mutex;
-    mutex tts_mutex;
+            {
+                lock_guard<mutex> lock(whisperMutex);
+                cout << "\n[OMNI] Processing Wake Word Command..." << endl;
 
-    // ==========================================
-    // POST /transcribe
-    // ==========================================
+                const int optimalThreads = getOptimalWhisperThreads();
+                bool melReady = false;
+                const char* lockedLang = detectAllowedLanguage(whisperContext, pcmFloat, optimalThreads, melReady);
 
-    server.Post(
-        "/transcribe",
+                whisper_full_params whisperParams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+                whisperParams.language = lockedLang;
+                if (strcmp(lockedLang, "en") == 0) {
+                    whisperParams.initial_prompt = "Stop, shut up, quiet, notepad, spring boot, jarvis, tutorial, browser, GrapheneOS, One UI.";
+                }
+                whisperParams.translate = false;
+                whisperParams.no_context = true;
+                whisperParams.single_segment = true;
+                whisperParams.print_progress = false;
+                whisperParams.print_realtime = false;
+                whisperParams.print_timestamps = false;
+                whisperParams.n_threads = optimalThreads;
 
-        [whisper_context, &whisper_mutex](
-            const httplib::Request& request,
-            httplib::Response& response
-            ) {
-                cout << "\n[Jarvis STT] "
-                    << "Received POST /transcribe"
-                    << endl;
+                // Pass (nullptr, 0) when melReady is true so whisper_full reuses the mel spectrogram
+                // already computed in detectAllowedLanguage instead of running whisper_pcm_to_mel twice.
+                const int inferenceResult = whisper_full(
+                    whisperContext,
+                    whisperParams,
+                    melReady ? nullptr : pcmFloat.data(),
+                    melReady ? 0 : static_cast<int>(pcmFloat.size())
+                );
 
+                if (inferenceResult != 0) {
+                    cerr << "[OMNI] Whisper inference failed." << endl;
+                    return;
+                }
+
+                const int segmentCount = whisper_full_n_segments(whisperContext);
+                for (int segmentIndex = 0; segmentIndex < segmentCount; ++segmentIndex) {
+                    const char* segmentText = whisper_full_get_segment_text(whisperContext, segmentIndex);
+                    if (segmentText != nullptr) {
+                        transcription += segmentText;
+                    }
+                }
+            }
+
+            if (!transcription.empty()) {
+                if (isNoiseArtifact(transcription)) {
+                    cout << "[OMNI] Dropping silence/noise artifact: " << transcription << endl;
+                    return;
+                }
+
+                cout << "[OMNI] Transcription: " << transcription << endl;
+
+                try {
+                    nlohmann::json json = { {"text", transcription} };
+                    httplib::Client cli("http://127.0.0.1:8080");
+                    cli.set_connection_timeout(2, 0);
+                    cli.set_read_timeout(5, 0);
+
+                    auto res = cli.Post("/api/jarvis/command", json.dump(), "application/json");
+                    if (res && res->status == 200) {
+                        cout << "[OMNI] Sent to Java successfully." << endl;
+                    }
+                    else if (res) {
+                        cerr << "[OMNI] Java returned error HTTP code: " << res->status << endl;
+                    }
+                    else {
+                        cerr << "[OMNI] No response from Java (httplib error code: "
+                            << static_cast<int>(res.error()) << "). Java may still be processing the command." << endl;
+                    }
+                }
+                catch (const std::exception& e) {
+                    cerr << "[OMNI] C++ Exception during network call: " << e.what() << endl;
+                }
+            }
+            };
+
+        AudioCapture audio_capture(
+            wakeWordDetector,
+            on_speech_detected,
+            on_wake_word_detected
+        );
+
+        if (!audio_capture.start()) {
+            throw runtime_error("Failed to start continuous audio capture.");
+        }
+
+        httplib::Server server;
+
+        server.Get("/health", [](const httplib::Request&, httplib::Response& response) {
+            const nlohmann::json result = {
+                {"status", "ok"},
+                {"service", "jarvis-voice-cpp"}
+            };
+            response.set_content(result.dump(), "application/json; charset=UTF-8");
+            });
+
+        server.Post("/transcribe", [whisperContext, &whisperMutex](const httplib::Request& request, httplib::Response& response) {
+            try {
                 if (!request.form.has_file("file")) {
-                    cerr << "[Jarvis STT] "
-                        << "No 'file' field found."
-                        << endl;
-
                     response.status = 400;
-
-                    response.set_content(
-                        R"({"error":"No file uploaded"})",
-                        "application/json; charset=UTF-8"
-                    );
-
+                    response.set_content(R"({"error":"No file uploaded"})", "application/json; charset=UTF-8");
                     return;
                 }
 
-                const auto& file =
-                    request.form.get_file("file");
+                const auto& file = request.form.get_file("file");
+                const string& wavAudio = file.content;
 
-                cout << "[Jarvis STT] Filename: "
-                    << file.filename << endl;
-
-                cout << "[Jarvis STT] Content-Type: "
-                    << file.content_type << endl;
-
-                cout << "[Jarvis STT] File size: "
-                    << file.content.size()
-                    << " bytes" << endl;
-
-                const string& audio = file.content;
-
-                if (audio.size() <= 44) {
-                    cerr << "[Jarvis STT] "
-                        << "Audio file is empty."
-                        << endl;
-
+                if (wavAudio.size() <= sizeof(WavHeader)) {
                     response.status = 400;
-
-                    response.set_content(
-                        R"({"error":"Audio file is empty"})",
-                        "application/json; charset=UTF-8"
-                    );
-
+                    response.set_content(R"({"error":"Audio file is empty"})", "application/json; charset=UTF-8");
                     return;
                 }
 
-                // Пропускаем 44 байта WAV-заголовка.
-                const int16_t* pcm16 =
-                    reinterpret_cast<const int16_t*>(
-                        audio.data() + 44
-                        );
+                const size_t pcmBytes = wavAudio.size() - sizeof(WavHeader);
+                const size_t pcmLength = pcmBytes / sizeof(int16_t);
+                vector<float> pcmFloat(pcmLength);
+                const char* pcmStart = wavAudio.data() + sizeof(WavHeader);
 
-                const size_t pcm16_length =
-                    (audio.size() - 44) /
-                    sizeof(int16_t);
-
-                vector<float> pcmf32;
-                pcmf32.resize(pcm16_length);
-
-                for (size_t i = 0;
-                    i < pcm16_length;
-                    ++i) {
-
-                    pcmf32[i] =
-                        static_cast<float>(pcm16[i]) /
-                        32768.0f;
+                for (size_t i = 0; i < pcmLength; ++i) {
+                    int16_t sample = 0;
+                    memcpy(&sample, pcmStart + i * sizeof(int16_t), sizeof(int16_t));
+                    pcmFloat[i] = static_cast<float>(sample) / 32768.0f;
                 }
 
-                cout << "[Jarvis STT] PCM samples: "
-                    << pcmf32.size() << endl;
-
-                whisper_full_params whisper_params =
-                    whisper_full_default_params(
-                        WHISPER_SAMPLING_GREEDY
-                    );
-
-                whisper_params.language = "auto";
-                whisper_params.translate = false;
-
-                whisper_params.print_progress = false;
-                whisper_params.print_realtime = false;
-                whisper_params.print_timestamps = false;
-
-                whisper_params.n_threads = 4;
-
-                string result_text;
-
+                string transcription;
                 {
-                    lock_guard<mutex> lock(
-                        whisper_mutex
-                    );
+                    lock_guard<mutex> lock(whisperMutex);
+                    const int optimalThreads = getOptimalWhisperThreads();
+                    bool melReady = false;
+                    const char* lockedLang = detectAllowedLanguage(whisperContext, pcmFloat, optimalThreads, melReady);
 
-                    cout << "[Jarvis STT] "
-                        << "Inference started..."
-                        << endl;
+                    whisper_full_params whisperParams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+                    whisperParams.language = lockedLang;
+                    whisperParams.translate = false;
+                    whisperParams.no_context = true;
+                    whisperParams.single_segment = true;
+                    whisperParams.print_progress = false;
+                    whisperParams.print_realtime = false;
+                    whisperParams.print_timestamps = false;
+                    whisperParams.n_threads = optimalThreads;
 
-                    const int whisper_result =
-                        whisper_full(
-                            whisper_context,
-                            whisper_params,
-                            pcmf32.data(),
-                            static_cast<int>(
-                                pcmf32.size()
-                                )
-                        );
-
-                    if (whisper_result != 0) {
-                        cerr << "[Jarvis STT] "
-                            << "Inference failed."
-                            << endl;
-
-                        response.status = 500;
-
-                        response.set_content(
-                            R"({"error":"Whisper inference failed"})",
-                            "application/json; charset=UTF-8"
-                        );
-
-                        return;
+                    if (whisper_full(
+                            whisperContext,
+                            whisperParams,
+                            melReady ? nullptr : pcmFloat.data(),
+                            melReady ? 0 : static_cast<int>(pcmFloat.size())
+                        ) != 0) {
+                        throw runtime_error("Whisper inference failed");
                     }
-
-                    const int segment_count =
-                        whisper_full_n_segments(
-                            whisper_context
-                        );
-
-                    cout << "[Jarvis STT] Segments: "
-                        << segment_count << endl;
-
-                    for (int i = 0;
-                        i < segment_count;
-                        ++i) {
-
-                        const char* segment_text =
-                            whisper_full_get_segment_text(
-                                whisper_context,
-                                i
-                            );
-
-                        if (segment_text != nullptr) {
-                            result_text += segment_text;
-                        }
+                    const int segmentCount = whisper_full_n_segments(whisperContext);
+                    for (int i = 0; i < segmentCount; ++i) {
+                        const char* text = whisper_full_get_segment_text(whisperContext, i);
+                        if (text != nullptr) transcription += text;
                     }
                 }
 
-                cout << "[Jarvis STT] Transcription: "
-                    << result_text << endl;
+                const nlohmann::json result = { {"text", transcription} };
+                response.set_content(result.dump(), "application/json; charset=UTF-8");
+            }
+            catch (const exception&) {
+                response.status = 500;
+                response.set_content(R"({"error":"Speech recognition failed"})", "application/json; charset=UTF-8");
+            }
+            });
 
-                const string json_response =
-                    "{\"text\":\"" +
-                    escapeJson(result_text) +
-                    "\"}";
+        server.Post("/tts", [&voicePool, &ttsMutex](const httplib::Request& request, httplib::Response& response) {
+            lock_guard<mutex> lock(ttsMutex);
+            cout << "\n[Jarvis TTS] Received request" << endl;
 
-                response.set_content(
-                    json_response,
-                    "application/json; charset=UTF-8"
-                );
-        }
-    );
+            try {
+                const nlohmann::json requestJson = nlohmann::json::parse(request.body);
+                const string text = requestJson.value("text", "");
+                string lang = requestJson.value("language", "en");
 
-    // ==========================================
-    // POST /tts
-    // ==========================================
-
-    server.Post(
-        "/tts",
-
-        [&tts, &tts_mutex](
-            const httplib::Request& request,
-            httplib::Response& response
-            ) {
-                cout << "\n[Jarvis TTS] "
-                    << "Received POST /tts"
-                    << endl;
-
-                // Временные случайные ID фонем.
-                // После подключения phonemizer здесь
-                // будут настоящие фонемы из текста.
-                const vector<int64_t> test_phonemes = {
-                    14,
-                    5,
-                    23,
-                    76,
-                    2,
-                    8,
-                    19,
-                    3
-                };
-
-                vector<float> audio_array;
-
-                {
-                    lock_guard<mutex> lock(tts_mutex);
-
-                    audio_array =
-                        tts.synthesize(test_phonemes);
-                }
-
-                if (audio_array.empty()) {
-                    cerr << "[Jarvis TTS] "
-                        << "Failed to generate audio."
-                        << endl;
-
-                    response.status = 500;
-
-                    response.set_content(
-                        R"({"error":"TTS inference failed"})",
-                        "application/json; charset=UTF-8"
-                    );
-
+                if (text.empty()) {
+                    response.status = 400;
+                    response.set_content(R"({"error":"Text is empty"})", "application/json; charset=UTF-8");
                     return;
                 }
 
-                string wav_payload =
-                    floatToWav(audio_array);
-
-                if (wav_payload.empty()) {
-                    cerr << "[Jarvis TTS] "
-                        << "Failed to create WAV."
-                        << endl;
-
-                    response.status = 500;
-
-                    response.set_content(
-                        R"({"error":"Failed to create WAV"})",
-                        "application/json; charset=UTF-8"
-                    );
-
-                    return;
+                // Нормализация кода языка до 2 символов
+                if (lang.size() > 2) {
+                    lang = lang.substr(0, 2);
                 }
 
-                cout << "[Jarvis TTS] Audio samples: "
-                    << audio_array.size() << endl;
+                // Железная страховка: если в тексте есть кириллица — всегда говорим голосом Дениса (ru)!
+                if (containsCyrillic(text)) {
+                    lang = "ru";
+                }
+                else if (lang != "en" && lang != "ru" && lang != "lt") {
+                    lang = "en";
+                }
 
-                cout << "[Jarvis TTS] WAV size: "
-                    << wav_payload.size()
-                    << " bytes" << endl;
+                // Выбираем синтезатор из пула (если нужная модель не загружена — фоллбэк на английский)
+                auto it = voicePool.find(lang);
+                if (it == voicePool.end()) {
+                    cout << "[Jarvis TTS] Voice for '" << lang << "' not loaded, falling back to 'en'." << endl;
+                    it = voicePool.find("en");
+                }
 
-                response.set_content(
-                    wav_payload,
-                    "audio/wav"
-                );
-        }
-    );
+                cout << "[Jarvis TTS] Voice: [" << it->first << "] | Text: " << text << endl;
+                const SynthesizedAudio audio = it->second->synthesize(text);
+                const string wavPayload = floatToWav(audio.samples, audio.sample_rate);
 
-    // ==========================================
-    // Start server
-    // ==========================================
+                response.set_content(wavPayload, "audio/wav");
+                cout << "[Jarvis TTS] Response: " << wavPayload.size() << " bytes" << endl;
+            }
+            catch (const exception& e) {
+                cerr << "[Jarvis TTS] ERROR: " << e.what() << endl;
+                response.status = 500;
+                response.set_content(R"({"error":"TTS synthesis failed"})", "application/json; charset=UTF-8");
+            }
+            });
 
-    cout << "[Jarvis Voice Engine] "
-        << "Server listening on "
-        << "http://127.0.0.1:5000"
-        << endl;
+        cout << "\n[Jarvis Voice Engine] Ready!" << endl;
+        cout << "[Jarvis Voice Engine] http://127.0.0.1:5000" << endl;
 
-    const bool started =
         server.listen("0.0.0.0", 5000);
-
-    if (!started) {
-        cerr << "[Jarvis Voice Engine] "
-            << "Failed to start server on port 5000."
-            << endl;
-
-        whisper_free(whisper_context);
-
+        whisper_free(whisperContext);
+        return 0;
+    }
+    catch (const exception& exception) {
+        cerr << "\n[Jarvis Voice Engine] FATAL ERROR: " << exception.what() << endl;
+        if (whisperContext != nullptr) {
+            whisper_free(whisperContext);
+        }
         return 1;
     }
-
-    // Выполнится после остановки сервера.
-    whisper_free(whisper_context);
-
-    return 0;
 }

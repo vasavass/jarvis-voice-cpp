@@ -1,234 +1,181 @@
-﻿#include "VoiceSynthesizer.h"
+#include "VoiceSynthesizer.h"
 
-#include <cstdint>
+#include <algorithm>
+#include <cctype>
 #include <iostream>
-#include <utility>
-#include <vector>
+#include <stdexcept>
+
+namespace {
+
+    // Defensive normalization & padding for short strings (< 15 chars)
+    // so espeak-ng / libpiper VITS never return 0 audio samples on short commands like "Done, sir." or "Yes, sir."
+    std::string prepare_tts_text(const std::string& raw_text) {
+        const auto first = raw_text.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            return {};
+        }
+        const auto last = raw_text.find_last_not_of(" \t\r\n");
+        std::string processed = raw_text.substr(first, last - first + 1);
+
+        const char back = processed.back();
+        if (back != '.' && back != '!' && back != '?') {
+            processed.push_back('.');
+        }
+
+        if (processed.size() < 15) {
+            // Add trailing clause/pause padding for short utterances so VITS duration predictor
+            // and STFT windowing always have sufficient phoneme frames.
+            processed += " ";
+        }
+
+        return processed;
+    }
+
+} // namespace
 
 VoiceSynthesizer::VoiceSynthesizer(
-    const std::wstring& model_path
-)
-    : env(
-        ORT_LOGGING_LEVEL_WARNING,
-        "JarvisTTS"
-    ),
-    session(nullptr),
-    memory_info(
-        Ort::MemoryInfo::CreateCpu(
-            OrtArenaAllocator,
-            OrtMemTypeDefault
-        )
-    )
-{
+    const std::string& model_path,
+    const std::string& config_path,
+    const std::string& espeak_data_path
+) {
     std::cout
-        << "[Jarvis TTS] Initializing ONNX Environment..."
+        << "[Jarvis TTS] Initializing libpiper..."
         << std::endl;
 
-    Ort::SessionOptions session_options;
-
-    session_options.SetIntraOpNumThreads(4);
-
-    session_options.SetGraphOptimizationLevel(
-        GraphOptimizationLevel::ORT_ENABLE_ALL
+    synthesizer_ = piper_create(
+        model_path.c_str(),
+        config_path.c_str(),
+        espeak_data_path.c_str()
     );
 
-    try {
-        session = Ort::Session(
-            env,
-            model_path.c_str(),
-            session_options
+    if (synthesizer_ == nullptr) {
+        throw std::runtime_error(
+            "Failed to create Piper synthesizer"
         );
-
-        std::cout
-            << "[Jarvis TTS] ONNX Model loaded successfully!"
-            << std::endl;
     }
-    catch (const Ort::Exception& exception) {
-        std::cerr
-            << "[Jarvis TTS] ERROR: Failed to load ONNX model: "
-            << exception.what()
-            << std::endl;
 
-        throw;
+    std::cout
+        << "[Jarvis TTS] Piper version: "
+        << piper_version()
+        << std::endl;
+
+    std::cout
+        << "[Jarvis TTS] Voice model loaded successfully!"
+        << std::endl;
+}
+
+VoiceSynthesizer::~VoiceSynthesizer() {
+    if (synthesizer_ != nullptr) {
+        piper_free(synthesizer_);
+        synthesizer_ = nullptr;
     }
 }
 
-// Этот метод находится СНАРУЖИ конструктора.
-std::vector<float> VoiceSynthesizer::synthesize(
-    const std::vector<int64_t>& phonemes
+SynthesizedAudio VoiceSynthesizer::synthesize(
+    const std::string& text
 ) {
-    if (phonemes.empty()) {
+    const std::string prepared_text = prepare_tts_text(text);
+    if (prepared_text.empty()) {
         return {};
     }
 
-    // ==========================================
-    // ЭТАП А: Подготовка данных
-    // ==========================================
+    // Один synthesizer нельзя одновременно использовать
+    // из нескольких HTTP-потоков.
+    std::lock_guard<std::mutex> lock(mutex_);
 
-    std::vector<int64_t> phoneme_lengths = {
-        static_cast<int64_t>(phonemes.size())
-    };
+    piper_synthesize_options options =
+        piper_default_synthesize_options(synthesizer_);
 
-    std::vector<float> scales = {
-        0.667f, // noise_scale
-        1.0f,   // length_scale
-        0.8f    // noise_width
-    };
-
-    // ==========================================
-    // ЭТАП Б: Формы тензоров
-    // ==========================================
-
-    std::vector<int64_t> phonemes_shape = {
-        1,
-        static_cast<int64_t>(phonemes.size())
-    };
-
-    std::vector<int64_t> phoneme_lengths_shape = {
-        1
-    };
-
-    std::vector<int64_t> scales_shape = {
-        3
-    };
-
-    // CreateTensor требует обычный указатель,
-    // хотя ONNX Runtime не изменяет входной массив.
-    int64_t* phonemes_data =
-        const_cast<int64_t*>(phonemes.data());
-
-    // ==========================================
-    // ЭТАП В: Создание тензоров
-    // ==========================================
-
-    Ort::Value phonemes_tensor =
-        Ort::Value::CreateTensor<int64_t>(
-            memory_info,
-            phonemes_data,
-            phonemes.size(),
-            phonemes_shape.data(),
-            phonemes_shape.size()
-        );
-
-    Ort::Value lengths_tensor =
-        Ort::Value::CreateTensor<int64_t>(
-            memory_info,
-            phoneme_lengths.data(),
-            phoneme_lengths.size(),
-            phoneme_lengths_shape.data(),
-            phoneme_lengths_shape.size()
-        );
-
-    Ort::Value scales_tensor =
-        Ort::Value::CreateTensor<float>(
-            memory_info,
-            scales.data(),
-            scales.size(),
-            scales_shape.data(),
-            scales_shape.size()
-        );
-
-    std::vector<Ort::Value> input_tensors;
-    input_tensors.reserve(3);
-
-    input_tensors.push_back(
-        std::move(phonemes_tensor)
-    );
-
-    input_tensors.push_back(
-        std::move(lengths_tensor)
-    );
-
-    input_tensors.push_back(
-        std::move(scales_tensor)
-    );
-
-    // ==========================================
-    // ЭТАП Г: Запуск модели Piper
-    // ==========================================
-
-    const char* input_names[] = {
-        "input",
-        "input_lengths",
-        "scales"
-    };
-
-    const char* output_names[] = {
-        "output"
-    };
+    options.length_scale = 1.0f;
+    options.noise_scale = 0.667f;
+    options.noise_w_scale = 0.8f;
 
     std::cout
-        << "[Jarvis TTS] Starting inference. Phonemes: "
-        << phonemes.size()
+        << "[Jarvis TTS] Starting synthesis: "
+        << prepared_text
         << std::endl;
 
-    std::vector<Ort::Value> output_tensors;
-
-    try {
-        output_tensors = session.Run(
-            Ort::RunOptions{ nullptr },
-            input_names,
-            input_tensors.data(),
-            input_tensors.size(),
-            output_names,
-            1
+    auto run_piper_pass = [&](const std::string& input_text, SynthesizedAudio& out) {
+        const int start_result = piper_synthesize_start(
+            synthesizer_,
+            input_text.c_str(),
+            &options
         );
+
+        if (start_result != PIPER_OK) {
+            throw std::runtime_error(
+                "piper_synthesize_start failed with code " +
+                std::to_string(start_result)
+            );
+        }
+
+        while (true) {
+            piper_audio_chunk chunk{};
+
+            const int chunk_result =
+                piper_synthesize_next(
+                    synthesizer_,
+                    &chunk
+                );
+
+            // NOTE: libpiper returns PIPER_DONE on the final audio chunk (when chunk.is_last == true),
+            // which for single-sentence phrases ("Done, sir.", "Yes, sir.") is the very first chunk!
+            // Always harvest chunk.samples before breaking on PIPER_DONE / chunk.is_last.
+            if (chunk_result != PIPER_OK && chunk_result != PIPER_DONE) {
+                throw std::runtime_error(
+                    "piper_synthesize_next failed with code " +
+                    std::to_string(chunk_result)
+                );
+            }
+
+            if (chunk.sample_rate > 0) {
+                out.sample_rate = chunk.sample_rate;
+            }
+
+            if (chunk.samples != nullptr &&
+                chunk.num_samples > 0) {
+
+                out.samples.insert(
+                    out.samples.end(),
+                    chunk.samples,
+                    chunk.samples + chunk.num_samples
+                );
+            }
+
+            if (chunk.is_last || chunk_result == PIPER_DONE) {
+                break;
+            }
+        }
+    };
+
+    SynthesizedAudio result;
+    run_piper_pass(prepared_text, result);
+
+    // Defensive fallback if espeak-ng produced 0 phoneme frames on a very short/unusual string
+    if (result.samples.empty()) {
+        const std::string fallback_text = prepared_text + " ... .";
+        run_piper_pass(fallback_text, result);
     }
-    catch (const Ort::Exception& exception) {
-        std::cerr
-            << "[Jarvis TTS] Inference failed: "
-            << exception.what()
-            << std::endl;
 
-        return {};
+    // Ensure short phrases never crash with empty audio even on punctuation-only inputs
+    if (result.samples.empty()) {
+        const std::size_t silent_samples = static_cast<std::size_t>(
+            (result.sample_rate > 0 ? result.sample_rate : 22050) / 10
+        );
+        result.samples.assign(silent_samples, 0.0f);
     }
-
-    // ==========================================
-    // ЭТАП Д: Извлечение звука
-    // ==========================================
-
-    if (output_tensors.empty()) {
-        std::cerr
-            << "[Jarvis TTS] Model returned no outputs."
-            << std::endl;
-
-        return {};
+    else if (prepared_text.size() < 15) {
+        // Append 40ms of clean trailing silence pad for short phrases to prevent audio clipping
+        const std::size_t pad_samples = static_cast<std::size_t>(result.sample_rate / 25);
+        result.samples.insert(result.samples.end(), pad_samples, 0.0f);
     }
-
-    if (!output_tensors[0].IsTensor()) {
-        std::cerr
-            << "[Jarvis TTS] Output is not a tensor."
-            << std::endl;
-
-        return {};
-    }
-
-    float* output_data =
-        output_tensors[0]
-        .GetTensorMutableData<float>();
-
-    const size_t output_size =
-        output_tensors[0]
-        .GetTensorTypeAndShapeInfo()
-        .GetElementCount();
-
-    if (output_data == nullptr || output_size == 0) {
-        std::cerr
-            << "[Jarvis TTS] Model returned empty audio."
-            << std::endl;
-
-        return {};
-    }
-
-    std::vector<float> audio_data(
-        output_data,
-        output_data + output_size
-    );
 
     std::cout
         << "[Jarvis TTS] Audio generated. Samples: "
-        << audio_data.size()
+        << result.samples.size()
+        << ", sample rate: "
+        << result.sample_rate
         << std::endl;
 
-    return audio_data;
+    return result;
 }

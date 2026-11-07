@@ -1,18 +1,32 @@
 #pragma once
-#include <onnxruntime_cxx_api.h>
+
+#include <mutex>
 #include <string>
 #include <vector>
-#include <iostream>
+
+#include <piper.h>
+
+struct SynthesizedAudio {
+    std::vector<float> samples;
+    int sample_rate = 22050;
+};
 
 class VoiceSynthesizer {
 private:
-    Ort::Env env;
-    Ort::Session session;
-    Ort::MemoryInfo memory_info;
+    piper_synthesizer* synthesizer_ = nullptr;
+    std::mutex mutex_;
 
 public:
-    VoiceSynthesizer(const std::wstring& model_path);
-    std::vector<float> synthesize(
-        const std::vector<int64_t>& phonemes
+    VoiceSynthesizer(
+        const std::string& model_path,
+        const std::string& config_path,
+        const std::string& espeak_data_path
     );
+
+    ~VoiceSynthesizer();
+
+    VoiceSynthesizer(const VoiceSynthesizer&) = delete;
+    VoiceSynthesizer& operator=(const VoiceSynthesizer&) = delete;
+
+    SynthesizedAudio synthesize(const std::string& text);
 };
